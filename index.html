@@ -983,6 +983,8 @@ body.galaxy-mode #zoomIndicator {
     const _raw = localStorage.getItem('le_tranchant_save');
     if(_raw){ const _s = JSON.parse(_raw); if(_s.lang) window._lang = _s.lang; }
   } catch(_e){}
+  // [OPT] Sync html lang attribute for accessibility
+  document.documentElement.lang = window._lang === 'en' ? 'en' : 'fr';
   // Highlight the correct lang button as soon as DOM is ready
   function _syncLangButtons(){
     const frBtn = document.getElementById('langBtn_fr');
@@ -3033,6 +3035,10 @@ let galaxyMode = false;
 let _staticBgCanvas = null;
 let _staticBgKey    = '';   // '${W}|${H}' — invalide si dimensions changent
 
+// [OPT-D] Idem pour le fond étoilé galaxie — référencé dans _resize()
+let _galaxyStarsBg = null;
+let _galaxyStarsBgKey = '';
+
 NAV.Canvas = (function () {
 
   // === Données constantes ===
@@ -3061,6 +3067,8 @@ NAV.Canvas = (function () {
     _canvas.height = p.clientHeight - 16; // 16 = hauteur barre notif (constante intentionnelle)
     // Invalider le fond statique (grille + étoiles) — sera rerebuild au prochain frame
     _staticBgKey = '';
+    // [OPT-D] Invalider aussi le fond étoilé galaxie
+    _galaxyStarsBgKey = '';
   }
 
   // === Projections monde ↔ écran ===
@@ -3087,7 +3095,9 @@ NAV.Canvas = (function () {
     // Aberration chromatique (IIFE auto-exécutée)
     (function chromaticBurst() {
       const W = _canvas.width, H = _canvas.height;
-      chrCvs.width = W; chrCvs.height = H;
+      // [OPT] Ne resize que si nécessaire — évite GPU buffer reset à chaque zoom
+      if(chrCvs.width !== W) chrCvs.width = W;
+      if(chrCvs.height !== H) chrCvs.height = H;
       const cc    = chrCvs.getContext('2d');
       const shift = 6 + Math.random() * 6;
       const start = performance.now();
@@ -3252,11 +3262,13 @@ const RESOLUTIONS  = NAV.Canvas.RESOLUTIONS;
 const ENHANCE_MSGS = NAV.Canvas.ENHANCE_MSGS;
 
 // w2s / s2w : 40 et 5 callsites dans tout le code de rendu
-const w2s = (...args) => NAV.Canvas.w2s(...args);
-const s2w = (...args) => NAV.Canvas.s2w(...args);
+// [OPT-A] Référence directe au lieu de (...args) => fn(...args) — 0 overhead
+const w2s = NAV.Canvas.w2s;
+const s2w = NAV.Canvas.s2w;
 
 // triggerEnhance : 2 boutons HTML + 5 callsites JS
-const triggerEnhance = (...args) => NAV.Canvas.triggerEnhance(...args);
+// [OPT-A] Référence directe
+const triggerEnhance = NAV.Canvas.triggerEnhance;
 
 // ===== VIEWPORT SCALE =====
 // Nouveau système : zoom CSS sur <html> au lieu de transform:scale sur .screen.
@@ -3409,6 +3421,16 @@ NAV.Utils.seededRand = function(seed) {
 // Bridge global — 3 callsites : seededRand(42), seededRand(77), seededRand(314).
 const seededRand = (...args) => NAV.Utils.seededRand(...args);
 
+// [OPT #12] fastRand — PRNG ultra-rapide pour shimmer/jitter visuel (pas crypto)
+// Mulberry32 : ~3-4× plus rapide que Math.random(), état mutable, période 2^32
+let _fastRandState = (Math.random() * 0xFFFFFFFF) >>> 0;
+function fastRand(){
+  _fastRandState |= 0; _fastRandState = _fastRandState + 0x6D2B79F5 | 0;
+  let t = Math.imul(_fastRandState ^ _fastRandState >>> 15, 1 | _fastRandState);
+  t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+  return ((t ^ t >>> 14) >>> 0) / 0x100000000;
+}
+
 // ---------------------------------------------------
 // NAV.Scene — données du système stellaire Moënne
 // Contient : corps célestes (objects), ceinture (BELT),
@@ -3438,51 +3460,57 @@ NAV.Scene = (function () {
 
   // === Génération des astéroïdes (déterministe, seed 42) ===
   const asteroids = [];
+
+  // [OPT-DEDUP] Facteur commun entre génération initiale et _spawnExtraAsteroids
+  function _generateAsteroid(rng, index, total) {
+    const r = rng;
+    const baseR   = 1.4 + r() * 4.0;
+    const nVerts  = 5 + Math.floor(r() * 4);
+    const verts   = [];
+    for(let v = 0; v < nVerts; v++) {
+      const ang = (v / nVerts) * Math.PI * 2 + (r() - 0.5) * 0.7;
+      const rad = baseR * (0.5 + r() * 0.5);
+      verts.push({ a: ang, r: rad });
+    }
+    verts.sort((a, b) => a.a - b.a);
+
+    const shade   = 0.4 + r() * 0.6;
+    const g1      = Math.floor(40  + shade * 80);
+    const g2      = Math.floor(80  + shade * 100);
+    const g3      = Math.floor(25  + shade * 50);
+    const gStroke = Math.floor(60  + shade * 110);
+
+    const baseAngle    = (index / total) * Math.PI * 2;
+    const jitter       = (r() - 0.5) * 0.28;
+    const radialJitter = 1 + (r() - 0.5) * 0.12;
+    const crackCount   = Math.floor(r() * 3);
+
+    return {
+      orbitRadius:  BELT.orbitRadius * radialJitter,
+      orbitAngle:   baseAngle + jitter,
+      orbitSpeed:   0.000028 + r() * 0.000012,
+      eccentricity: BELT.eccentricity + (r() - 0.5) * 0.04,
+      tilt:         BELT.tilt         + (r() - 0.5) * 0.06,
+      ry_ratio:     BELT.ry_ratio,
+      r:            baseR,
+      spinSpeed:    (r() - 0.5) * 0.004,
+      spinAngle:    r() * Math.PI * 2,
+      verts,
+      fill:      `rgb(${g3},${g1},${g3})`,
+      stroke:    `rgb(${g3},${gStroke},${g3})`,
+      highlight: `rgb(${g3+10},${g2},${g3+10})`,
+      facet:     `rgb(5,${g3},5)`,
+      cracks: Array.from({ length: crackCount }, () => ({
+        ax: (r()-0.5)*1.8, ay: (r()-0.5)*1.8,
+        bx: (r()-0.5)*1.8, by: (r()-0.5)*1.8,
+      })),
+    };
+  }
+
   (function () {
-    const rng = NAV.Utils.seededRand(42);  // appel direct — pas le bridge global
+    const rng = NAV.Utils.seededRand(42);
     for(let i = 0; i < 55; i++) {
-      const r = rng;
-      const baseR   = 1.4 + r() * 4.0;
-      const nVerts  = 5 + Math.floor(r() * 4);
-      const verts   = [];
-      for(let v = 0; v < nVerts; v++) {
-        const ang = (v / nVerts) * Math.PI * 2 + (r() - 0.5) * 0.7;
-        const rad = baseR * (0.5 + r() * 0.5);
-        verts.push({ a: ang, r: rad });
-      }
-      verts.sort((a, b) => a.a - b.a);
-
-      const shade   = 0.4 + r() * 0.6;
-      const g1      = Math.floor(40  + shade * 80);
-      const g2      = Math.floor(80  + shade * 100);
-      const g3      = Math.floor(25  + shade * 50);
-      const gStroke = Math.floor(60  + shade * 110);
-
-      const baseAngle   = (i / 55) * Math.PI * 2;
-      const jitter      = (r() - 0.5) * 0.28;
-      const radialJitter = 1 + (r() - 0.5) * 0.12;
-      const crackCount  = Math.floor(r() * 3);
-
-      asteroids.push({
-        orbitRadius:  BELT.orbitRadius * radialJitter,
-        orbitAngle:   baseAngle + jitter,
-        orbitSpeed:   (0.000028 + r() * 0.000012) * 1,
-        eccentricity: BELT.eccentricity + (r() - 0.5) * 0.04,
-        tilt:         BELT.tilt         + (r() - 0.5) * 0.06,
-        ry_ratio:     BELT.ry_ratio,
-        r:            baseR,
-        spinSpeed:    (r() - 0.5) * 0.004,
-        spinAngle:    r() * Math.PI * 2,
-        verts,
-        fill:      `rgb(${g3},${g1},${g3})`,
-        stroke:    `rgb(${g3},${gStroke},${g3})`,
-        highlight: `rgb(${g3+10},${g2},${g3+10})`,
-        facet:     `rgb(5,${g3},5)`,
-        cracks: Array.from({ length: crackCount }, () => ({
-          ax: (r()-0.5)*1.8, ay: (r()-0.5)*1.8,
-          bx: (r()-0.5)*1.8, by: (r()-0.5)*1.8,
-        })),
-      });
+      asteroids.push(_generateAsteroid(rng, i, 55));
     }
   })();
 
@@ -3510,7 +3538,7 @@ NAV.Scene = (function () {
   }
 
   // === API publique ===
-  return { objects, BELT, asteroids, getObjWorldPos, getAstWorldPos };
+  return { objects, BELT, asteroids, getObjWorldPos, getAstWorldPos, _generateAsteroid };
 })();
 
 // --- Bridges globaux ---
@@ -3519,8 +3547,13 @@ NAV.Scene = (function () {
 const objects   = NAV.Scene.objects;
 const BELT      = NAV.Scene.BELT;
 const asteroids = NAV.Scene.asteroids;
+// [OPT] Pré-calculer Object.entries(objects) — évite 2 allocations/frame dans drawScene
+const _objEntries = Object.entries(objects);
+const _objValsCache = Object.values(objects);
 
 // Spawn additional asteroids (for upgrades)
+// [OPT-DEDUP] Utilise _generateAsteroid partagé avec la génération initiale
+const _generateAsteroid = NAV.Scene._generateAsteroid;
 window._spawnExtraAsteroids = function(count){
   const existing = asteroids.length;
   // Guard against double-spawn on reapply
@@ -3528,43 +3561,7 @@ window._spawnExtraAsteroids = function(count){
   const toSpawn = Math.max(0, 55 + count - existing);
   const rng = NAV.Utils.seededRand(777); // different seed from original belt
   for(let i = 0; i < toSpawn; i++){
-    const r = rng;
-    const baseR = 1.4 + r() * 4.0;
-    const nVerts = 5 + Math.floor(r() * 4);
-    const verts = [];
-    for(let v = 0; v < nVerts; v++){
-      const ang = (v / nVerts) * Math.PI * 2 + (r() - 0.5) * 0.7;
-      const rad = baseR * (0.5 + r() * 0.5);
-      verts.push({ a: ang, r: rad });
-    }
-    verts.sort((a, b) => a.a - b.a);
-    const shade = 0.4 + r() * 0.6;
-    const g1 = Math.floor(40 + shade * 80);
-    const g2 = Math.floor(80 + shade * 100);
-    const g3 = Math.floor(25 + shade * 50);
-    const gStroke = Math.floor(60 + shade * 110);
-    const baseAngle = ((existing + i) / 66) * Math.PI * 2;
-    const jitter = (r() - 0.5) * 0.28;
-    const radialJitter = 1 + (r() - 0.5) * 0.12;
-    asteroids.push({
-      orbitRadius:  BELT.orbitRadius * radialJitter,
-      orbitAngle:   baseAngle + jitter,
-      orbitSpeed:   (0.000028 + r() * 0.000012),
-      eccentricity: BELT.eccentricity + (r() - 0.5) * 0.04,
-      tilt:         BELT.tilt + (r() - 0.5) * 0.06,
-      ry_ratio:     BELT.ry_ratio,
-      r:            baseR,
-      spinSpeed:    (r() - 0.5) * 0.004,
-      spinAngle:    r() * Math.PI * 2,
-      verts,
-      fill:      `rgb(${g3},${g1},${g3})`,
-      stroke:    `rgb(${g3},${gStroke},${g3})`,
-      highlight: `rgb(${g3+10},${g2},${g3+10})`,
-      facet:     `rgb(5,${g3},5)`,
-      cracks: Array.from({ length: Math.floor(r()*3) }, () => ({
-        ax:(r()-0.5)*1.8, ay:(r()-0.5)*1.8, bx:(r()-0.5)*1.8, by:(r()-0.5)*1.8,
-      })),
-    });
+    asteroids.push(_generateAsteroid(rng, existing + i, 66));
   }
 };
 
@@ -3579,12 +3576,22 @@ function _trySetGolden(a){
 asteroids.forEach(a => _trySetGolden(a));
 
 // getObjWorldPos / getAstWorldPos : 34 et 10 callsites dans le code existant.
-const getObjWorldPos = (...args) => NAV.Scene.getObjWorldPos(...args);
-const getAstWorldPos = (...args) => NAV.Scene.getAstWorldPos(...args);
+// [OPT-A] Référence directe — supprime le coût spread/rest sur 44 appels hot-path
+const getObjWorldPos = NAV.Scene.getObjWorldPos;
+const getAstWorldPos = NAV.Scene.getAstWorldPos;
 
 let shipSPGlobal={x:0,y:0}, selectedObj='ruby',mouseX=0,mouseY=0,hoveredObj=null,animTime=0;
 // enhanceTimer, scrollCooldown — état local au rendu (dans NAV.Canvas._enhanceTimer)
 let scrollCooldown=false;
+let _lastHoverTick=0; // [OPT] throttle mousemove hover
+
+// [OPT] Cache tooltip DOM refs — évite 3× getElementById par mousemove (10/s)
+let _tooltipEl=null, _ttTitleEl=null, _ttBodyEl=null;
+function _getTooltipEls(){
+  if(!_tooltipEl) _tooltipEl=document.getElementById('tooltip');
+  if(!_ttTitleEl) _ttTitleEl=document.getElementById('tooltip-title');
+  if(!_ttBodyEl) _ttBodyEl=document.getElementById('tooltip-body');
+}
 
 // ---- Fond étoilé galaxie — pré-calculé une seule fois (seed 77) ----
 // Évite de recréer le générateur LCG 60×/s dans drawScene.
@@ -3598,7 +3605,38 @@ const _STAR_FIELD = (function(){
   return stars;
 })();
 
-// Bridges déclarés après NAV.Canvas : triggerEnhance = (...args) => NAV.Canvas.triggerEnhance(...args)
+// [OPT-D] Offscreen canvas pour les 300 étoiles galaxy — blit au lieu de 300 draw calls
+// (variables _galaxyStarsBg et _galaxyStarsBgKey hoistées avant NAV.Canvas pour éviter TDZ)
+function _buildGalaxyStarsBg(W, H) {
+  const key = `${W}|${H}`;
+  if(_galaxyStarsBgKey === key && _galaxyStarsBg) return;
+  if(!_galaxyStarsBg) _galaxyStarsBg = document.createElement('canvas');
+  _galaxyStarsBg.width = W;
+  _galaxyStarsBg.height = H;
+  const sc = _galaxyStarsBg.getContext('2d');
+  sc.fillStyle = '#000204';
+  sc.fillRect(0, 0, W, H);
+  // Grouper les étoiles par paliers de brightness pour réduire les changements de fillStyle
+  const buckets = {};
+  for(let i = 0; i < 300; i++){
+    const [sxr, syr, sb, sr] = _STAR_FIELD[i];
+    const key2 = sb.toFixed(2);
+    if(!buckets[key2]) buckets[key2] = [];
+    buckets[key2].push([sxr*W, syr*H, sr]);
+  }
+  for(const [bKey, stars] of Object.entries(buckets)){
+    sc.fillStyle = `rgba(200,210,255,${bKey})`;
+    sc.beginPath();
+    for(const [sx, sy, sr] of stars){
+      sc.moveTo(sx+sr, sy);
+      sc.arc(sx, sy, sr, 0, Math.PI*2);
+    }
+    sc.fill();
+  }
+  _galaxyStarsBgKey = key;
+}
+
+// Bridges déclarés après NAV.Canvas : triggerEnhance = NAV.Canvas.triggerEnhance (ref directe)
 
 function drawScene(c,W,H,T){
   // Galaxy view at min zooms (0=full, 1=zoomed on Moënne)
@@ -3612,13 +3650,9 @@ function drawScene(c,W,H,T){
     c.save();
     c.globalAlpha=galaxyAlpha;
     // Draw static background BEFORE pan transform so it always fills the canvas
-    c.fillStyle='#000204';c.fillRect(0,0,W,H);
-    // Utilise le fond pré-calculé — évite de recréer seededRand(77) chaque frame
-    for(let i=0;i<300;i++){
-      const [sxr, syr, sb, sr] = _STAR_FIELD[i];
-      c.beginPath();c.arc(sxr*W, syr*H, sr, 0, Math.PI*2);
-      c.fillStyle=`rgba(200,210,255,${sb})`;c.fill();
-    }
+    // [OPT-D] Blit du fond étoilé pré-rendu — 1 drawImage au lieu de 300 arc()
+    _buildGalaxyStarsBg(W, H);
+    c.drawImage(_galaxyStarsBg, 0, 0);
     // Galaxy background gradient — W/H dépendant, mis en cache
     if(!_gradCache.gpg || _gradCache.gpg_key !== `${W}|${H}`){
       const g=c.createLinearGradient(0,H*0.3,W,H*0.7);
@@ -3698,6 +3732,7 @@ function drawScene(c,W,H,T){
   drawStellarBg(c, W, H, T);
 
   // ===== GRAVITATIONAL FIELD LINES FROM MOËNNE =====
+  // [OPT-C] Gradient allocation réduite : un seul gradient réutilisé via globalAlpha
   if(zoomIdx>=1 && zoomIdx<=7){
     const starSP = w2s(0.5, 0.5, W, H);
     const gravAlpha = 0.18;
@@ -3706,43 +3741,43 @@ function drawScene(c,W,H,T){
     const maxR      = Math.min(W,H) * 0.72;
 
     c.save();
+    c.lineWidth = 0.55;
     for(let li=0; li<lineCount; li++){
-      // Each filament starts at a fixed angle, slightly drifts over time
       const baseAng = (li/lineCount)*Math.PI*2 + T*0.000018;
-      const waveFrq = 0.9 + (li%3)*0.4; // vary wave frequency per line
+      const waveFrq = 0.9 + (li%3)*0.4;
       const waveAmp = 0.06 + (li%5)*0.012;
 
-      // Build path by stepping outward from edge inward to star (reversed: star to edge)
-      const pts = [];
+      // Dernier point calculé en premier pour le gradient
+      let lastPtX, lastPtY;
+      const pts_x = new Float64Array(segCount+1);
+      const pts_y = new Float64Array(segCount+1);
       for(let si=0; si<=segCount; si++){
         const t_  = si/segCount;
         const r   = t_ * maxR;
-        // Wave deflection — curls toward star as r decreases
         const wave = Math.sin(t_*Math.PI*waveFrq + T*0.00025 + li*0.77) * waveAmp * r;
         const ang  = baseAng + wave/Math.max(r,1);
-        pts.push({
-          x: starSP.x + Math.cos(ang)*r,
-          y: starSP.y + Math.sin(ang)*r*0.6, // slight elliptical perspective
-        });
+        pts_x[si] = starSP.x + Math.cos(ang)*r;
+        pts_y[si] = starSP.y + Math.sin(ang)*r*0.6;
       }
 
-      // Opacity: stronger near star, fades outward
+      // [OPT-C] Utiliser globalAlpha au lieu de bake l'alpha dans les colorStops
       const lineAlpha = gravAlpha * (0.55 + 0.45*Math.sin(T*0.0008 + li*0.4));
+      c.globalAlpha = lineAlpha;
       const grad = c.createLinearGradient(
         starSP.x, starSP.y,
-        pts[segCount].x, pts[segCount].y
+        pts_x[segCount], pts_y[segCount]
       );
-      grad.addColorStop(0,   `rgba(255,200,80,${lineAlpha*1.4})`);
-      grad.addColorStop(0.3, `rgba(200,140,40,${lineAlpha})`);
-      grad.addColorStop(1,   `rgba(180,120,30,0)`);
+      grad.addColorStop(0,   'rgba(255,200,80,0.25)');
+      grad.addColorStop(0.3, 'rgba(200,140,40,0.18)');
+      grad.addColorStop(1,   'rgba(180,120,30,0)');
 
       c.beginPath();
-      c.moveTo(pts[0].x, pts[0].y);
-      for(let si=1; si<=segCount; si++) c.lineTo(pts[si].x, pts[si].y);
+      c.moveTo(pts_x[0], pts_y[0]);
+      for(let si=1; si<=segCount; si++) c.lineTo(pts_x[si], pts_y[si]);
       c.strokeStyle = grad;
-      c.lineWidth = 0.55;
       c.stroke();
     }
+    c.globalAlpha = 1;
     c.restore();
   }
   // ==================================================
@@ -3790,8 +3825,10 @@ function drawScene(c,W,H,T){
   }
 
   
-  Object.entries(objects).forEach(([k,obj])=>{
-    if(k==='star')return;
+  // [OPT] for-loop sur _objEntries pré-calculé
+  for(let _oi2=0; _oi2<_objEntries.length; _oi2++){
+    const [k,obj]=_objEntries[_oi2];
+    if(k==='star')continue;
     const rx=obj.orbitRadius*scale,ry=rx*0.55;
     c.save();c.translate(center.x,center.y);
     c.beginPath();c.ellipse(0,0,rx,ry,0,0,Math.PI*2);
@@ -3821,7 +3858,7 @@ function drawScene(c,W,H,T){
       c.restore();
     }
     c.restore();
-  });
+  }
 
   
   asteroids.forEach(a=>{
@@ -4004,16 +4041,18 @@ function drawScene(c,W,H,T){
       c.globalAlpha = fade * 0.88;
       const grad = c.createLinearGradient(px2, py2, px2 - p.nx*tail, py2 - p.ny*tail);
       grad.addColorStop(0, p.col);
-      grad.addColorStop(0.6, p.col.replace('0.9','0.35').replace('0.85','0.3').replace('0.8','0.25').replace('0.88','0.3'));
+      // [OPT] Cache la couleur atténuée sur la particule — évite 4 replace() par frame
+      if(!p._colFaded) p._colFaded = p.col.replace('0.9','0.35').replace('0.85','0.3').replace('0.8','0.25').replace('0.88','0.3');
+      grad.addColorStop(0.6, p._colFaded);
       grad.addColorStop(1, 'rgba(255,255,255,0)');
       c.strokeStyle = grad;
-      c.lineWidth = (1.5 + Math.random()*0.5) * sz;
+      c.lineWidth = (1.5 + fastRand()*0.5) * sz;
       c.beginPath();
       c.moveTo(px2, py2);
       c.lineTo(px2 - p.nx*tail, py2 - p.ny*tail);
       c.stroke();
       c.beginPath();
-      c.arc(px2, py2, (1.5 + Math.random()*0.5) * sz, 0, Math.PI*2);
+      c.arc(px2, py2, (1.5 + fastRand()*0.5) * sz, 0, Math.PI*2);
       c.fillStyle = p.col;
       c.fill();
       c.restore();
@@ -4046,12 +4085,18 @@ function drawScene(c,W,H,T){
       const tsp = w2s(txw||0.5, tyw||0.5, W, H);
       const dx2=tsp.x-nspx, dy2=tsp.y-nspy, dist2=Math.hypot(dx2,dy2);
       if(dist2>8){
-        const facCol = npc.fac ? (npc.fac.name==='UNI'?'rgba(80,160,255,':'rgba(80,220,120,') : (npc.faction?(npc.faction.name==='UNI'?'rgba(80,160,255,':'rgba(80,220,120,'):'rgba(200,160,80,');
+        // [OPT] Couleurs faction pré-définies — évite 4 concaténations string/frame
+        const _facName = npc.fac ? npc.fac.name : (npc.faction ? npc.faction.name : null);
+        const _isUni = _facName === 'UNI';
+        const facCol55 = _facName ? (_isUni ? 'rgba(80,160,255,0.55)' : 'rgba(80,220,120,0.55)') : 'rgba(200,160,80,0.55)';
+        const facCol80 = _facName ? (_isUni ? 'rgba(80,160,255,0.8)'  : 'rgba(80,220,120,0.8)')  : 'rgba(200,160,80,0.8)';
+        const facCol70 = _facName ? (_isUni ? 'rgba(80,160,255,0.7)'  : 'rgba(80,220,120,0.7)')  : 'rgba(200,160,80,0.7)';
+        const facCol65 = _facName ? (_isUni ? 'rgba(80,160,255,0.65)' : 'rgba(80,220,120,0.65)') : 'rgba(200,160,80,0.65)';
         // Dashed line
         c.save();
         c.setLineDash([5,8]);
         c.lineDashOffset=-(animTime*0.012)%13;
-        c.strokeStyle=facCol+'0.55)';
+        c.strokeStyle=facCol55;
         c.lineWidth=1;
         c.beginPath();c.moveTo(nspx,nspy);c.lineTo(tsp.x,tsp.y);c.stroke();
         c.setLineDash([]);
@@ -4059,17 +4104,17 @@ function drawScene(c,W,H,T){
         const ang2=Math.atan2(dy2,dx2);
         c.translate(tsp.x,tsp.y);c.rotate(ang2);
         c.beginPath();c.moveTo(7,0);c.lineTo(-5,4);c.lineTo(-3,0);c.lineTo(-5,-4);c.closePath();
-        c.fillStyle=facCol+'0.8)';c.fill();
+        c.fillStyle=facCol80;c.fill();
         c.restore();
         // Target dot
         c.save();
         c.beginPath();c.arc(tsp.x,tsp.y,4,0,Math.PI*2);
-        c.strokeStyle=facCol+'0.7)';c.lineWidth=1.2;c.stroke();
+        c.strokeStyle=facCol70;c.lineWidth=1.2;c.stroke();
         c.restore();
         // Label at midpoint
         c.save();
         c.font='11px Share Tech Mono';
-        c.fillStyle=facCol+'0.65)';
+        c.fillStyle=facCol65;
         const mid2x=(nspx+tsp.x)/2, mid2y=(nspy+tsp.y)/2-8;
         const stateStr=npc.state==='mining'?'EXTRACTION':npc.state==='docked'?'À QUAI':npc.state==='hunt'?'CHASSE':'→';
         c.fillText(`${npc.shipId||npc.id||''} ${stateStr}`,mid2x,mid2y);
@@ -4083,7 +4128,8 @@ function drawScene(c,W,H,T){
 
   
   updateHoverState();
-  Object.entries(objects).forEach(([k,obj])=>drawObj(c,k,obj,W,H,T));
+  // [OPT] Évite 2× Object.entries() par frame — utilise le tableau pré-calculé
+  for(let _ei=0; _ei<_objEntries.length; _ei++){ const [k,obj]=_objEntries[_ei]; drawObj(c,k,obj,W,H,T); }
 
   // Upgrade structures
   if(typeof drawUpgradeVisuals==='function') drawUpgradeVisuals(c,W,H,T);
@@ -5976,19 +6022,24 @@ function _buildStaticBg(W, H) {
   _staticBgCanvas.height = H;
   const sc = _staticBgCanvas.getContext('2d');
 
-  // Grille fine
+  // [OPT-F] Grille fine — un seul beginPath/stroke pour toutes les lignes
   sc.strokeStyle = 'rgba(30,35,40,0.1)';
   sc.lineWidth   = 0.3;
-  for(let x = 0; x < W; x += 60){ sc.beginPath(); sc.moveTo(x,0); sc.lineTo(x,H); sc.stroke(); }
-  for(let y = 0; y < H; y += 60){ sc.beginPath(); sc.moveTo(0,y); sc.lineTo(W,y); sc.stroke(); }
+  sc.beginPath();
+  for(let x = 0; x < W; x += 60){ sc.moveTo(x,0); sc.lineTo(x,H); }
+  for(let y = 0; y < H; y += 60){ sc.moveTo(0,y); sc.lineTo(W,y); }
+  sc.stroke();
 
-  // 90 étoiles ponctuelles statiques (positions déterministes)
+  // [OPT-F] 90 étoiles ponctuelles — un seul beginPath/fill pour tous les arcs
   sc.fillStyle = 'rgba(180,190,200,0.25)';
+  sc.beginPath();
   for(let i = 0; i < 90; i++){
     const sx = (Math.sin(i * 127.3) * 0.5 + 0.5) * W;
     const sy = (Math.cos(i * 63.7)  * 0.5 + 0.5) * H;
-    sc.beginPath(); sc.arc(sx, sy, 0.5, 0, Math.PI * 2); sc.fill();
+    sc.moveTo(sx + 0.5, sy);
+    sc.arc(sx, sy, 0.5, 0, Math.PI * 2);
   }
+  sc.fill();
   _staticBgKey = key;
 }
 
@@ -5999,9 +6050,25 @@ let _totalPausedMs  = 0; // durée cumulée de toutes les pauses — sert à dé
 let _simRate = 1; // 0 pendant la pause, 1 sinon — multiplie les vitesses NPC pour geler le mouvement
 
 function draw(T){
+  // [OPT #9] Garde la boucle vivante même si une frame throw
+  try { _drawInner(T); } catch(e) {
+    _drawErrors++;
+    if(_drawErrors <= 5) console.error('[RENDER]', e);
+    if(_drawErrors >= 5) {
+      console.error('[RENDER] 5 erreurs consécutives — boucle stoppée');
+      try { showAlert({txt:'ERREUR RENDU — SYSTÈME DÉGRADÉ',color:'#ff4400',icon:'⚠',category:'system'}); } catch(_){}
+      return; // stop RAF
+    }
+  }
+  requestAnimationFrame(draw);
+}
+let _drawErrors = 0;
+function _drawInner(T){
+  _drawErrors = 0; // reset si la frame réussit
   animTime=T;
 
-  // ── Perf : delta-time réel (clamped 50ms max pour éviter les sauts après tab-switch)
+  // ── Perf : delta-time réel (clamped 33ms max pour un retour fluide après tab-switch)
+  // [OPT #10] 33ms = 30fps minimum garanti, vs 50ms (20fps) qui causait des sauts d'orbite
   if(_paused){
     _frameDt = 0;
     _simRate = 0;
@@ -6009,7 +6076,7 @@ function draw(T){
     _frameNow = performance.now();
     T = _frozenT; // utiliser T figé pour toutes les animations
   } else {
-    _frameDt  = _prevT ? Math.min(T - _prevT, 50) : 16;
+    _frameDt  = _prevT ? Math.min(T - _prevT, 33) : 16;
     _simRate  = 1;
     _prevT    = T;
     _frameNow = performance.now();
@@ -6038,7 +6105,11 @@ function draw(T){
   if(pix>1){
     
     const OW=Math.ceil(W/pix),OH=Math.ceil(H/pix);
-    offCanvas.width=OW;offCanvas.height=OH;
+    // [OPT-B] Ne réassigner width/height que si les dimensions changent
+    // — évite un reset GPU complet du buffer canvas à chaque frame
+    if(offCanvas.width!==OW) offCanvas.width=OW;
+    if(offCanvas.height!==OH) offCanvas.height=OH;
+    offCtx.clearRect(0,0,OW,OH);
     drawScene(offCtx,OW,OH,T);
     ctx.clearRect(0,0,W,H);
     ctx.imageSmoothingEnabled=false;
@@ -6068,11 +6139,10 @@ function draw(T){
 
   
   // Orbites normalisées par delta-time (orbitSpeed calibré pour ~16ms/frame)
+  // [OPT] for-loop au lieu de forEach — évite création closure × 60 par frame
   const _orbitDt = _frameDt / 16;
-  Object.values(objects).forEach(o=>{if(o.orbitSpeed)o.orbitAngle+=o.orbitSpeed*_orbitDt;});
-  asteroids.forEach(a=>{a.orbitAngle+=a.orbitSpeed*_orbitDt;});
-
-  requestAnimationFrame(draw);
+  for(let _oi=0; _oi<_objValsCache.length; _oi++){ const o=_objValsCache[_oi]; if(o.orbitSpeed) o.orbitAngle+=o.orbitSpeed*_orbitDt; }
+  for(let _ai=0, _al=asteroids.length; _ai<_al; _ai++) asteroids[_ai].orbitAngle+=asteroids[_ai].orbitSpeed*_orbitDt;
 }
 requestAnimationFrame(draw);
 
@@ -6249,15 +6319,29 @@ canvas.addEventListener('click',(e)=>{
   }
 });
 
+// [OPT #8] Tooltip positioning — extrait de 8 copier-coller identiques
+function _positionTooltip(tooltip, e){
+  let tx=e.clientX+16, ty=e.clientY-10;
+  if(tx+230>window.innerWidth) tx=e.clientX-246;
+  tooltip.style.left=tx+'px'; tooltip.style.top=ty+'px';
+}
+
 canvas.addEventListener('mousemove',(e)=>{
   const rect=canvas.getBoundingClientRect();mouseX=e.clientX-rect.left;mouseY=e.clientY-rect.top;
-  const W=canvas.width,H=canvas.height;const tooltip=document.getElementById('tooltip');
-  const _ttTitle=document.getElementById('tooltip-title');
-  const _ttBody=document.getElementById('tooltip-body');
+  // [OPT] Throttle le hover/tooltip à 100ms — le crosshair et le drag restent temps réel
+  const _hoverNow = performance.now();
+  if(_hoverNow - (_lastHoverTick||0) < 100) return;
+  _lastHoverTick = _hoverNow;
+  const W=canvas.width,H=canvas.height;
+  _getTooltipEls();
+  const tooltip=_tooltipEl, _ttTitle=_ttTitleEl, _ttBody=_ttBodyEl;
+  if(!tooltip) return;
   let found=false;hoveredObj=null;
   let _hoveringstar = false;
   if(zoomIdx<7 && zoomIdx>1){
-    Object.entries(objects).forEach(([k,obj])=>{
+    // [OPT] _objEntries au lieu de Object.entries(objects)
+    for(let _hoi=0; _hoi<_objEntries.length; _hoi++){
+      const [k,obj]=_objEntries[_hoi];
       const wp=getObjWorldPos(obj);const sp=w2s(wp.x,wp.y,W,H);
       if(Math.hypot(mouseX-sp.x,mouseY-sp.y)<obj.r*2+16){
         hoveredObj=obj;found=true;
@@ -6267,10 +6351,9 @@ canvas.addEventListener('mousemove',(e)=>{
         if(k==='ring_uni'||k==='ring_ref'||k==='navron') startTooltipPreview(k); else stopTooltipPreview();
         _ttBody.innerHTML=obj.desc+(obj.faction?`<br><br><span style="color:${obj.faction==='UNI'?'#4499ff':'#00ff41'}">[${obj.faction}]</span>`:'');
         tooltip.classList.add('visible');
-        let tx=e.clientX+16,ty=e.clientY-10;if(tx+230>window.innerWidth)tx=e.clientX-246;
-        tooltip.style.left=tx+'px';tooltip.style.top=ty+'px';
+        _positionTooltip(tooltip, e);
       }
-    });
+    }
     // Ship hover — check against animated ship position
     if(!found && typeof shipSPGlobal !== 'undefined'){
       if(Math.hypot(mouseX-shipSPGlobal.x, mouseY-shipSPGlobal.y) < 20){
@@ -6279,8 +6362,7 @@ canvas.addEventListener('mousemove',(e)=>{
         _ttTitle.className='tooltip-title';
         _ttBody.innerHTML=`${t('Corvette de classe Fronde // Réformée')}<br>${t('Cap: Rubis Stellaire')}<br><span style="color:var(--amber2)">${t('En approche — Distance: 0.34 AU')}</span>`;
         tooltip.classList.add('visible');
-        let tx=e.clientX+16,ty=e.clientY-10;if(tx+230>window.innerWidth)tx=e.clientX-246;
-        tooltip.style.left=tx+'px';tooltip.style.top=ty+'px';
+        _positionTooltip(tooltip, e);
       }
     }
     // Special NPC hover
@@ -6307,8 +6389,7 @@ canvas.addEventListener('mousemove',(e)=>{
             `Vaisseau de combat<br><span style="color:${fc}">[${s.faction}]</span> — ${stateStr}<br><span style="color:${hpCol}">PV : ${s.hp} / ${s.maxHp}</span>` +
             _getThought(s, true);
           tooltip.classList.add('visible');
-          let tx=e.clientX+16,ty=e.clientY-10;if(tx+230>window.innerWidth)tx=e.clientX-246;
-          tooltip.style.left=tx+'px';tooltip.style.top=ty+'px';
+          _positionTooltip(tooltip, e);
           break;
         }
       }
@@ -6331,8 +6412,7 @@ canvas.addEventListener('mousemove',(e)=>{
             `Extracteur minier lourd<br><span style="color:${m.fac.name==='UNI'?'var(--blue3)':'var(--green3)'}">[${m.fac.name}]</span> — ${m.state==='transit'?'EN TRANSIT':m.state==='departing'?'EN DÉPART':m.state==='idle'?'⏸ EN PAUSE':m.state==='returning'?'→ RETOUR ANNEAU':m.state==='rdv'?'⟁ RDV MARCHAND':'À QUAI'}${mp}` +
             _getThought(m);
           tooltip.classList.add('visible');
-          let tx=e.clientX+16,ty=e.clientY-10;if(tx+230>window.innerWidth)tx=e.clientX-246;
-          tooltip.style.left=tx+'px';tooltip.style.top=ty+'px';
+          _positionTooltip(tooltip, e);
           break;
         }
       }
@@ -6370,8 +6450,7 @@ canvas.addEventListener('mousemove',(e)=>{
               _getThought(npc);
           }
           tooltip.classList.add('visible');
-          let tx=e.clientX+16,ty=e.clientY-10;if(tx+230>window.innerWidth)tx=e.clientX-246;
-          tooltip.style.left=tx+'px';tooltip.style.top=ty+'px';
+          _positionTooltip(tooltip, e);
           break;
         }
       }
@@ -6440,8 +6519,7 @@ canvas.addEventListener('mousemove',(e)=>{
             const timeLeft=Math.max(0,Math.ceil((p.lifetime-p.age)/1000));
             _ttBody.innerHTML=`<span style="color:rgba(220,180,60,0.9);">${t('Cargaison de contrebande')}</span><br><span style="color:rgba(140,160,180,0.7);">${t('Cliquer pour récupérer un cargo tier haut')}</span><br><span style="color:rgba(120,120,120,0.55);">Disparaît dans ${timeLeft}s</span>`;
             tooltip.classList.add('visible');
-            let tx=e.clientX+16,ty=e.clientY-10; if(tx+230>window.innerWidth) tx=e.clientX-246;
-            tooltip.style.left=tx+'px'; tooltip.style.top=ty+'px';
+            _positionTooltip(tooltip, e);
             break outer2;
           }
         }
@@ -6459,8 +6537,7 @@ canvas.addEventListener('mousemove',(e)=>{
           const timeLeft=Math.max(0,Math.ceil((fc.lifetime-fc.age)/1000));
           _ttBody.innerHTML=`<span style="color:rgba(255,220,80,0.95);">◆ ${fc.cargo}</span><br><span style="color:rgba(140,160,180,0.7);">${t('Cliquer pour récupérer')}</span><br><span style="color:rgba(120,120,120,0.55);">Disparaît dans ${timeLeft}s</span>`;
           tooltip.classList.add('visible');
-          let tx=e.clientX+16,ty=e.clientY-10; if(tx+230>window.innerWidth) tx=e.clientX-246;
-          tooltip.style.left=tx+'px'; tooltip.style.top=ty+'px';
+          _positionTooltip(tooltip, e);
           break;
         }
       }
@@ -6505,8 +6582,7 @@ canvas.addEventListener('mousemove',(e)=>{
           }
           _ttBody.innerHTML = body;
           tooltip.classList.add('visible');
-          let tx=e.clientX+16,ty=e.clientY-10;if(tx+230>window.innerWidth)tx=e.clientX-246;
-          tooltip.style.left=tx+'px';tooltip.style.top=ty+'px';
+          _positionTooltip(tooltip, e);
           break;
         }
       }
@@ -6527,7 +6603,7 @@ canvas.addEventListener('mousemove',(e)=>{
   const wx=s2w(mouseX,mouseY,W,H);
   if(zoomIdx>1) document.getElementById('coordDisplay').innerHTML=`N ${(44+(wx.x-.5)*10).toFixed(2)}°54'32 // E ${(70+(wx.y-.5)*20).toFixed(2)}°44'21<br>ΔZ - ${(8448-Math.abs((wx.x-.5)*800+(wx.y-.5)*400)).toFixed(0)} NA`;
 });
-canvas.addEventListener('mouseleave',()=>{mouseX=0;mouseY=0;document.getElementById('tooltip').classList.remove('visible');window._hoveredDebris=null;});
+canvas.addEventListener('mouseleave',()=>{mouseX=0;mouseY=0;_getTooltipEls();if(_tooltipEl)_tooltipEl.classList.remove('visible');window._hoveredDebris=null;});
 
 const MODAL_DATA = {
   mission: {
@@ -7673,6 +7749,7 @@ const JOURNAL_TYPES = {
   system:        { icon:'◉', color:'rgba(140,140,140,0.6)' },
   combat_result: { icon:'⚔', color:'rgba(220,180,60,0.95)' },
 };
+window.JOURNAL_TYPES = JOURNAL_TYPES;
 
 function logEvent(type, msg){
   const now = new Date();
@@ -10050,10 +10127,10 @@ NAV.Alerts = (function () {
 NAV.Alerts.init();
 
 // --- Bridges globaux ---
-// showAlert : 7 callsites (NPCSystem, autodestruction, éruption solaire)
+// showAlert : 36 callsites (NPC, combats, économie, achievements, éruptions)
 // triggerScreenEffect : 3 callsites (autodestruction)
-const showAlert          = (msg)    => NAV.Alerts.show(msg);
-const triggerScreenEffect = (effect) => NAV.Alerts.screenEffect(effect);
+const showAlert          = NAV.Alerts.show;
+const triggerScreenEffect = NAV.Alerts.screenEffect;
 
 // ---------------------------------------------------
 // NAV.Dice — widget dés de jeu de rôle (d4 à d20)
@@ -11248,7 +11325,12 @@ const lsKey          = (...args) => NAV.Login.key(...args);
 const lsSubmit       = ()        => NAV.Login.submit();
 const lsSkipClick    = ()        => NAV.Login.skipClick();
 const startBoot      = ()        => NAV.Login.startBoot();
-const shutdownSystem = ()        => NAV.Login.shutdown();
+const shutdownSystem = () => {
+  // [OPT #6] Nettoyer les intervals persistants au shutdown (ticker, marchands, prestige, etc.)
+  (window._persistentIntervals || []).forEach(id => clearInterval(id));
+  window._persistentIntervals = [];
+  NAV.Login.shutdown();
+};
 
 // Lancement immédiat de l'init Login
 NAV.Login.init();
@@ -11761,6 +11843,11 @@ const NPC_FACTIONS = NAV.NPC.factions;
 const SPECIAL_NPCS = NAV.NPC.special;
 const NPC_MINING  = NAV.NPC.mining;
 const TORPEDOES   = NAV.NPC.torpedoes;
+// Exposer sur window pour les blocs <script> suivants (Market, Save, Upgrades)
+window.NPC_SHIPS    = NPC_SHIPS;
+window.NPC_FACTIONS = NPC_FACTIONS;
+window.SPECIAL_NPCS = SPECIAL_NPCS;
+window.NPC_MINING   = NPC_MINING;
 
 // spawnNPC / spawnNPCFaction / spawnArmyBattle : appelés depuis le clavier ('V', '!') et timers
 // → fonctions globales conservées, bridges const pour clarté
@@ -11973,6 +12060,7 @@ const CARGO_TYPES = [
   'Épices rares',
   'Cargaison non déclarée',
 ];
+window.CARGO_TYPES = CARGO_TYPES;
 
 // Cargos tier haut pour le loot contrebandier
 const LOOT_CARGOS_HIGH = [
@@ -12056,11 +12144,11 @@ function spendMerchantPool(tier){
 }
 
 // Construit les slots cargo/need d'un marchand selon son tier (avec mélange inter-tier)
+// [OPT #4] Pool global pré-calculé — évite flatMap + new Set à chaque spawn
+const _ALL_TIER_CARGOS = [...new Set(Object.values(MERCHANT_TIERS).flatMap(t => t.cargos))];
 function buildMerchantSlots(tier){
   const td = MERCHANT_TIERS[tier];
-  // Pool élargi : cargos du tier + tiers adjacents pour éviter les boucles
-  const allTierCargos = Object.values(MERCHANT_TIERS).flatMap(t => t.cargos);
-  const uniqueAll = [...new Set(allTierCargos)];
+  const uniqueAll = _ALL_TIER_CARGOS;
 
   function pickCargo(primaryTier, excluded){
     const primary = MERCHANT_TIERS[primaryTier];
@@ -13681,8 +13769,8 @@ function updateSpecialNPCs(c, W, H, T){
 
 // Hover tooltip for special NPCs
 function checkSpecialNPCHover(mx, my, e, tooltip){
-  const _ttTitle = document.getElementById('tooltip-title');
-  const _ttBody  = document.getElementById('tooltip-body');
+  _getTooltipEls();
+  const _ttTitle = _ttTitleEl, _ttBody = _ttBodyEl;
   if(!_ttTitle || !_ttBody) return false;
   for(const s of SPECIAL_NPCS){
     if(s.done || !s._spx) continue;
@@ -13700,9 +13788,7 @@ function checkSpecialNPCHover(mx, my, e, tooltip){
         _ttBody.innerHTML = tip.body + (s.type==='sonde' ? '' : _getThought(s));
       }
       tooltip.classList.add('visible');
-      let tx=e.clientX+16,ty=e.clientY-10;
-      if(tx+230>window.innerWidth) tx=e.clientX-246;
-      tooltip.style.left=tx+'px'; tooltip.style.top=ty+'px';
+      _positionTooltip(tooltip, e);
       return true;
     }
   }
@@ -15657,10 +15743,13 @@ function updateNPCShips(c, W, H, T){
   _npcSpawnTimer += _frameDt;
   const activeShips = NPC_SHIPS;
   const totalCount = activeShips.length;
-  const uniCount   = activeShips.filter(s => s.faction.name === 'UNI').length;
-  const refCount   = activeShips.filter(s => s.faction.name === 'REF').length;
 
   if(_npcSpawnTimer > _npcSpawnInterval && totalCount < (8 + (window._upgradeNPCBoost||0))){
+    // [OPT] Single-pass counter au lieu de 2× .filter().length — seulement quand le timer expire
+    let uniCount = 0, refCount = 0;
+    for(let _ci = 0; _ci < totalCount; _ci++){
+      if(activeShips[_ci].faction.name === 'UNI') uniCount++; else refCount++;
+    }
     const canSpawnUni = uniCount < 4 && !window._upgradeFinaleREF; // Finale REF: aucun UNI
     const canSpawnRef = refCount < 4;
     if(canSpawnUni || canSpawnRef){
@@ -17675,6 +17764,8 @@ function drawSysHoverFX(c, sys, sx, sy, T){
     }
     recomputeSystemRevenue();
     if(typeof window.renderSideEconomy==='function') window.renderSideEconomy();
+    // [OPT] Sync immédiat après trade — compense l'interval ralenti à 2s
+    syncAllMerchants();
     return result;
   };
 
@@ -19040,7 +19131,8 @@ function drawSysHoverFX(c, sys, sx, sy, T){
     if(e.key==='$'){e.preventDefault();if(typeof window.triggerRandomMarketEvent==='function') window.triggerRandomMarketEvent();}
   });
   // Intervalles persistants
-  window._persistentIntervals.push(setInterval(syncAllMerchants,300));
+  // [OPT] Interval réduit de 300ms → 2000ms — l'état marchand ne change que lors d'un trade
+  window._persistentIntervals.push(setInterval(syncAllMerchants,2000));
   // Premier render
   try{window.renderMarket();}catch(_e){console.error('MARKET_SYSTEM renderMarket init failed',_e);}
 })();
@@ -19883,8 +19975,10 @@ function drawSysHoverFX(c, sys, sx, sy, T){
   let _lastSaveTs    = 0;
 
   // === Migrations : convertit les anciennes versions vers la plus récente ===
+  // [OPT-ROBUST] try/catch par étape — une migration cassée ne perd pas toute la save
   function _migrateSave(save){
     if(!save || typeof save.v !== 'number') return null;
+    try {
     // v1 → v2 : ajouter combatResults extrait du journal
     if(save.v === 1){
       save.combatResults = Array.isArray(save.journal)
@@ -19892,22 +19986,29 @@ function drawSysHoverFX(c, sys, sx, sy, T){
         : [];
       save.v = 2;
     }
+    } catch(e){ console.warn('[SAVE] Migration v1→v2 failed:', e); save.v = 2; save.combatResults = []; }
+    try {
     // v2 → v3 : ajouter upgradeChoices
     if(save.v === 2){
       save.upgradeChoices = [null,null,null,null,null,null];
       save.v = 3;
     }
+    } catch(e){ console.warn('[SAVE] Migration v2→v3 failed:', e); save.v = 3; save.upgradeChoices = [null,null,null,null,null,null]; }
+    try {
     // v3 → v4 : ajouter achievements
     if(save.v === 3){
       save.achievements = { unlocked: {}, asteroidsMined: 0, battlesWitnessed: 0 };
       save.v = 4;
     }
+    } catch(e){ console.warn('[SAVE] Migration v3→v4 failed:', e); save.v = 4; save.achievements = { unlocked:{}, asteroidsMined:0, battlesWitnessed:0 }; }
+    try {
     // v4 → v5 : ajouter lang + tutorialSeen
     if(save.v === 4){
       save.lang = 'fr';
       save.tutorialSeen = true;
       save.v = 5;
     }
+    } catch(e){ console.warn('[SAVE] Migration v4→v5 failed:', e); save.v = 5; save.lang = 'fr'; save.tutorialSeen = true; }
     return save.v === SAVE_VERSION ? save : null;
   }
 
